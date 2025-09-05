@@ -35,7 +35,7 @@ import io
 import json
 import time
 import textwrap
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import streamlit as st
 import requests
@@ -91,6 +91,8 @@ if "raw_files" not in st.session_state:
     st.session_state.raw_files = []  # keep references to UploadedFiles
 if "last_response" not in st.session_state:
     st.session_state.last_response = ""
+if "last_autorag" not in st.session_state:
+    st.session_state.last_autorag = None
 
 # --- Utilities
 
@@ -178,76 +180,124 @@ def call_cloudflare_autorag(query: str, *, max_snippets: int = 5) -> Dict[str, A
         hits = result.get("hits") or result.get("results") or []
         for h in hits[:max_snippets]:
             txt = h.get("text") or h.get("chunk") or h.get("content") or ""
-            src = h.get("source") or h.get("metadata", {}).get("source") or h.get("url") or ""
+            src = h.get("source") or (h.get("metadata") or {}).get("source") or h.get("url") or ""
             if txt:
-                snippets.append({"text": txt, "source": src})
+                snippets.append({"text": txt, "source": src, "raw_hit": h})
     except Exception:
         pass
 
     return {"raw": data, "snippets": snippets}
 
 
-def build_augmented_prompt(user_query: str, *, use_files: bool, use_autorag: bool) -> str:
-    ctx_parts = []
+def prepare_contents_for_gemini(user_query: str, *, use_files: bool, use_autorag: bool) -> List[Any]:
+    """
+    Build structured contents (list of types.Content) for Gemini streaming API.
+    This includes:
+      - system instruction content (explicit rules + citation instruction)
+      - context contents (uploaded files excerpt and Autorag snippets, each labelled)
+      - user content (the question)
+    Returns a list of types.Content objects (but typing as Any to avoid import at top-level).
+    """
+    from google.genai import types
 
-    if use_files and st.session_state.files_ctx:
-        ctx_parts.append("User-uploaded context (excerpt):\n" + chunk_text(st.session_state.files_ctx, 12000))
-
-    if use_autorag:
-        rag = call_cloudflare_autorag(user_query)
-        st.session_state.last_autorag = rag
-        if rag.get("error"):
-            ctx_parts.append(f"[Autorag error] {rag['error']}")
-        else:
-            snips = rag.get("snippets", [])
-            if snips:
-                formatted = []
-                for i, s in enumerate(snips, 1):
-                    src = f" (source: {s['source']})" if s.get("source") else ""
-                    formatted.append(f"[{i}] {s['text'][:1500]}{src}")
-                ctx_parts.append("Cloudflare Autorag retrieval:\n" + "\n\n".join(formatted))
-            else:
-                ctx_parts.append("Cloudflare Autorag returned no snippets.")
-
+    # Base system instruction, but include explicit direction to cite RAG results.
     system_instructions = textwrap.dedent(
         """
         You are a helpful AI assistant inside a Streamlit app. Follow the rules:
-        - If context is provided below, cite it concisely in-line as [RAG #].
-        - Prefer factual, step-by-step answers. If uncertain, say so.
+        - Use the provided context below (if any) to answer the user's question.
+        - When using retrieved passages from the Cloudflare Autorag retrieval, explicitly cite them inline as [RAG #] where # matches the snippet numbering.
+        - If the answer relies on uploaded files, cite them as [FILE: filename] inline.
+        - If multiple sources conflict, state the conflict and provide which source you relied on.
+        - Prefer factual, step-by-step answers. If uncertain, say so and provide suggestions to verify.
         - Keep code blocks minimal and runnable where possible.
-        - When answering about uploaded files, ground your answer strictly in that content.
-        - If a user asks general questions, answer broadly, but still prefer accuracy.
         """
     ).strip()
 
-    context_blob = ("\n\n" + "\n\n".join(ctx_parts)) if ctx_parts else ""
-
-    return (
-        system_instructions
-        + "\n\nUser question: "
-        + user_query
-        + context_blob
+    contents: List[Any] = []
+    # Add system content
+    contents.append(
+        types.Content(
+            role="system",
+            parts=[types.Part.from_text(text=system_instructions)]
+        )
     )
 
+    # Add uploaded files context as a single system/context block (if requested)
+    if use_files and st.session_state.files_ctx:
+        files_excerpt = chunk_text(st.session_state.files_ctx, 12000)
+        file_block = "=== Uploaded files context ===\n\n" + files_excerpt
+        contents.append(
+            types.Content(
+                role="system",
+                parts=[types.Part.from_text(text=file_block)]
+            )
+        )
 
-def stream_gemini_response(prompt: str, *, model: str, temperature: float = 0.4):
-    # Build content as per user's provided sample code (with streaming)
+    # Add Autorag snippets as separate numbered block if requested
+    if use_autorag:
+        # Call Autorag here so the RAG result is available to include as a context block
+        rag = call_cloudflare_autorag(user_query)
+        st.session_state.last_autorag = rag
+        if rag.get("error"):
+            rag_block = f"[Autorag error] {rag['error']}"
+            contents.append(
+                types.Content(
+                    role="system",
+                    parts=[types.Part.from_text(text=rag_block)]
+                )
+            )
+        else:
+            snips = rag.get("snippets", [])
+            if snips:
+                # build numbered snippet block with explicit [RAG n] labels
+                formatted_snips = []
+                for i, s in enumerate(snips, start=1):
+                    src = f" (source: {s['source']})" if s.get("source") else ""
+                    # ensure snippet is trimmed reasonably
+                    snippet_text = s['text']
+                    snippet_text = snippet_text if len(snippet_text) <= 4000 else snippet_text[:4000] + "\n\n[TRUNCATED]"
+                    formatted_snips.append(f"[RAG {i}]{src}\n{snippet_text}")
+                rag_block = "=== Cloudflare Autorag retrieval (numbered) ===\n\n" + "\n\n---\n\n".join(formatted_snips)
+                contents.append(
+                    types.Content(
+                        role="system",
+                        parts=[types.Part.from_text(text=rag_block)]
+                    )
+                )
+            else:
+                contents.append(
+                    types.Content(
+                        role="system",
+                        parts=[types.Part.from_text(text="Cloudflare Autorag returned no snippets.")]
+                    )
+                )
+
+    # Finally add the user question (as user role)
+    contents.append(
+        types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=user_query)]
+        )
+    )
+
+    return contents
+
+
+def stream_gemini_response(contents: List[Any], *, model: str, temperature: float = 0.4):
+    """
+    Stream Gemini response for the provided `contents` list (list of types.Content).
+    Yields the chunks from the streaming generator so the UI can show incremental text.
+    """
     from google.genai import types
     client = get_gemini_client()
 
-    contents = [
-        types.Content(
-            role="user",
-            parts=[types.Part.from_text(text=prompt)],
-        )
-    ]
-
+    # Build a GenerateContentConfig similar to the user's sample
     generate_content_config = types.GenerateContentConfig(
         temperature=temperature,
         thinking_config=types.ThinkingConfig(thinking_budget=0),
     )
 
-    # Gemini streaming
+    # Gemini streaming using structured contents
     yield from client.models.generate_content_stream(
         model=model,
         contents=contents,
@@ -320,6 +370,10 @@ if st.session_state.files_ctx:
     with st.expander("Preview extracted file text (first 2,000 chars)"):
         st.code(st.session_state.files_ctx[:2000] + ("…" if len(st.session_state.files_ctx) > 2000 else ""))
 
+# Optionally show last Autorag response for debugging (collapsed)
+with st.expander("Debug: last Autorag raw response (collapse)"):
+    st.write(st.session_state.last_autorag)
+
 # Render previous chat
 for m in st.session_state.history:
     with st.chat_message(m["role"]):
@@ -344,22 +398,31 @@ if prompt:
         if not GEMINI_API_KEY:
             st.error("Missing GEMINI_API_KEY in Streamlit secrets.")
         else:
-            # Build augmented prompt
-            augmented = build_augmented_prompt(prompt, use_files=use_files, use_autorag=use_autorag)
-
+            # Build structured contents for Gemini that include Autorag context explicitly
             try:
-                # Stream tokens
-                for chunk in stream_gemini_response(augmented, model=model, temperature=temperature):
-                    text = getattr(chunk, "text", None)
-                    if not text:
-                        continue
-                    full_text += text
-                    placeholder.markdown(full_text)
-                st.session_state.last_response = full_text
+                contents = prepare_contents_for_gemini(prompt, use_files=use_files, use_autorag=use_autorag)
             except Exception as e:
-                st.error(f"Gemini error: {e}")
-                full_text += f"\n\n*Error: {e}*"
-                placeholder.markdown(full_text)
+                st.error(f"Failed to prepare contents: {e}")
+                contents = None
+
+            if contents is not None:
+                try:
+                    # Stream tokens
+                    for chunk in stream_gemini_response(contents, model=model, temperature=temperature):
+                        # Each chunk may have attributes; prefer chunk.text
+                        text = getattr(chunk, "text", None)
+                        if not text:
+                            # sometimes chunk.delta or chunk.content may exist
+                            text = getattr(chunk, "delta", None) or getattr(chunk, "content", None) or ""
+                        if not text:
+                            continue
+                        full_text += text
+                        placeholder.markdown(full_text)
+                    st.session_state.last_response = full_text
+                except Exception as e:
+                    st.error(f"Gemini error: {e}")
+                    full_text += f"\n\n*Error: {e}*"
+                    placeholder.markdown(full_text)
 
     # Save assistant message
     if st.session_state.last_response:
