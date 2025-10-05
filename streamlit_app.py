@@ -3,7 +3,6 @@ import os
 import io
 import json
 from typing import List, Dict, Any
-
 import streamlit as st
 import requests
 
@@ -20,7 +19,7 @@ except Exception:
 
 # --- PAGE CONFIG
 st.set_page_config(
-    page_title="Autorag AI Search Chat",
+    page_title="⚡ Autorag AI Search Chatbot",
     page_icon="⚡",
     layout="wide",
 )
@@ -85,11 +84,11 @@ def extract_text_from_upload(file) -> str:
 
 
 def call_autorag_search(query: str) -> Dict[str, Any]:
-    """Calls Cloudflare Autorag AI Search"""
+    """Calls Cloudflare Autorag AI Search per official API spec"""
     if not (CF_EMAIL and CF_API_KEY and CF_ACCOUNT_ID and CF_AUTORAG_ID):
         return {"error": "Missing Cloudflare credentials"}
 
-    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/autorag/rags/{CF_AUTORAG_ID}/ai-search"
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/autorag/rags/{CF_AUTORAG_ID}/ai-search"
 
     headers = {
         "Content-Type": "application/json",
@@ -99,18 +98,16 @@ def call_autorag_search(query: str) -> Dict[str, Any]:
     payload = {"query": query}
 
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=60)
-        if resp.status_code != 200:
+        resp = requests.post(url, headers=headers, json=payload, timeout=90)
+        if not resp.ok:
             return {"error": f"HTTP {resp.status_code}: {resp.text}"}
-        data = resp.json()
+        return resp.json()
     except Exception as e:
         return {"error": str(e)}
 
-    return data
-
 
 def build_query(user_input: str, use_files: bool) -> str:
-    """Augments user query with uploaded file context (if enabled)"""
+    """Combine user input with uploaded file context"""
     if use_files and st.session_state.files_ctx:
         snippet = st.session_state.files_ctx[:8000]
         return f"{user_input}\n\n=== Uploaded File Context ===\n{snippet}"
@@ -120,7 +117,7 @@ def build_query(user_input: str, use_files: bool) -> str:
 # --- SIDEBAR CONFIG
 with st.sidebar:
     st.title("⚙️ Settings")
-    st.caption("Configure query & session")
+    st.caption("Configure context and manage session")
 
     use_files = st.toggle("Use uploaded files as context", value=True)
 
@@ -143,7 +140,7 @@ with st.sidebar:
 
 # --- MAIN LAYOUT
 st.title("⚡ Cloudflare Autorag AI Search Chatbot")
-st.markdown("Chat directly with Cloudflare Autorag AI Search — no Gemini required.")
+st.markdown("Chat directly with Cloudflare’s native AI Search engine — no LLM key needed.")
 
 # Upload files
 uploads = st.file_uploader(
@@ -191,7 +188,11 @@ if prompt:
             full_text = f"❌ Error: {data['error']}"
         else:
             result = data.get("result") or data
-            hits = result.get("hits") or result.get("results") or []
+            if isinstance(result, dict):
+                hits = result.get("hits") or result.get("results") or []
+            else:
+                hits = []
+
             if not hits:
                 full_text = "⚠️ No relevant results found."
             else:
@@ -209,15 +210,16 @@ if prompt:
         st.session_state.history.append({"role": "assistant", "content": full_text})
         st.session_state.last_autorag = data
 
+
 # --- FOOTER
 st.divider()
 col1, col2, col3 = st.columns(3)
 with col1:
     tag("Tip")
-    st.caption("Upload files to enrich your Autorag query context.")
+    st.caption("Upload files to enrich your Autorag search context.")
 with col2:
     tag("Privacy")
-    st.caption("Files are processed only in-memory for this session.")
+    st.caption("Files are processed only in-memory during your session.")
 with col3:
-    tag("Data Source")
-    st.caption("All responses are directly from Cloudflare Autorag AI Search.")
+    tag("Engine")
+    st.caption("Powered by Cloudflare Autorag AI Search API.")
