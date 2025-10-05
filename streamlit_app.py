@@ -50,6 +50,7 @@ def tag(label: str):
 
 
 def extract_text_from_upload(file) -> str:
+    """Extracts text from uploaded PDF, DOCX, or TXT file"""
     name = file.name.lower()
     data = file.read()
     try:
@@ -84,17 +85,19 @@ def extract_text_from_upload(file) -> str:
 
 
 def call_autorag_search(query: str) -> Dict[str, Any]:
-    """Calls Cloudflare Autorag AI Search per official API spec"""
+    """Calls Cloudflare Autorag AI Search per latest official API spec"""
     if not (CF_EMAIL and CF_API_KEY and CF_ACCOUNT_ID and CF_AUTORAG_ID):
-        return {"error": "Missing Cloudflare credentials"}
+        return {"error": "Missing Cloudflare credentials or Autorag ID"}
 
-    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/autorag/rags/{CF_AUTORAG_ID}/ai-search"
+    # ✅ FIXED ENDPOINT (official 2025 path)
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/autorags/{CF_AUTORAG_ID}/search"
 
     headers = {
         "Content-Type": "application/json",
         "X-Auth-Email": CF_EMAIL,
         "X-Auth-Key": CF_API_KEY,
     }
+
     payload = {"query": query}
 
     try:
